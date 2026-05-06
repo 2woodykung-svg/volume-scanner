@@ -23,8 +23,8 @@ SCAN_INTERVAL_MIN    = 30      # สแกน intraday ทุก 30 นาที
 INTRADAY_SURGE_PCT   = 1.5     # sector ขึ้น/ลง >= 1.5% ถือว่าผิดปกติ
 MORNING_HOUR         = 8
 MORNING_MIN          = 0
-EVENING_HOUR         = 16
-EVENING_MIN          = 35
+EVENING_HOUR         = 17
+EVENING_MIN          = 0
 
 # ── SET Sectors และหุ้นตัวแทน ─────────────────────────────────────────
 # ใช้หุ้น market cap ใหญ่สุดของแต่ละ sector เป็นตัวแทน
@@ -181,7 +181,48 @@ async def fetch_sector_data(client: httpx.AsyncClient) -> dict[str, dict]:
 
 
 # ── Format Messages ────────────────────────────────────────────────────
-def fmt_morning_report(sector_data: dict) -> str:
+async def fetch_set_index(client: httpx.AsyncClient) -> dict | None:
+    """ดึงข้อมูล SET Index จาก Yahoo Finance"""
+    result = await fetch_ticker("^SET.BK", client)
+    if not result:
+        # fallback ใช้ SET50 ETF แทน
+        result = await fetch_ticker("TDEX.BK", client)
+    return result
+
+
+async def fetch_top_movers(client: httpx.AsyncClient) -> dict:
+    """หาหุ้นที่ขึ้น/ลงมากสุดใน SET วันนี้"""
+    # รวบรวมหุ้นทุกตัวจากทุก sector
+    all_tickers = []
+    for s in SECTORS.values():
+        all_tickers.extend(s["tickers"])
+    all_tickers = list(set(all_tickers))  # dedup
+
+    tasks   = [fetch_ticker(f"{t}.BK", client) for t in all_tickers]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    valid   = [r for r in results if isinstance(r, dict)]
+
+    if not valid:
+        return {"gainers": [], "losers": [], "most_active": []}
+
+    sorted_by_change = sorted(valid, key=lambda x: x["change_pct"], reverse=True)
+    sorted_by_volume = sorted(valid, key=lambda x: x["volume"],     reverse=True)
+
+    return {
+        "gainers":     sorted_by_change[:5],
+        "losers":      sorted_by_change[-5:][::-1],
+        "most_active": sorted_by_volume[:5],
+    }
+
+
+def fmt_volume(v: int) -> str:
+    if v >= 1_000_000_000: return f"{v/1_000_000_000:.1f}B"
+    if v >= 1_000_000:     return f"{v/1_000_000:.0f}M"
+    if v >= 1_000:         return f"{v/1_000:.0f}K"
+    return str(v)
+
+
+
     """Morning Briefing 08:00 — แนวโน้มก่อนตลาดเปิด"""
     now = datetime.now(BANGKOK_TZ)
     day_th = ["จันทร์","อังคาร","พุธ","พฤหัส","ศุกร์","เสาร์","อาทิตย์"]
@@ -241,51 +282,106 @@ def fmt_morning_report(sector_data: dict) -> str:
     return "\n".join(lines)
 
 
-def fmt_evening_report(sector_data: dict) -> str:
-    """Evening Summary 16:35 — สรุปผล sector ประจำวัน"""
+def fmt_evening_report(sector_data: dict,
+                        set_index: dict | None,
+                        movers: dict) -> str:
+    """Evening Summary 17:00 — สรุปปิดตลาดครบทุกมิติ"""
     sorted_sectors = sorted(
         sector_data.items(),
         key=lambda x: x[1]["avg_change"],
-        reverse=True
+        reverse=True,
     )
-
     winner = sorted_sectors[0]
     loser  = sorted_sectors[-1]
+    breadth_up   = sum(1 for _, s in sorted_sectors if s["avg_change"] > 0)
+    breadth_down = len(sorted_sectors) - breadth_up
+
+    now = datetime.now(BANGKOK_TZ)
+    day_th  = ["จันทร์","อังคาร","พุธ","พฤหัส","ศุกร์","เสาร์","อาทิตย์"]
+    weekday = day_th[now.weekday()]
+    date_str = now.strftime(f"วัน{weekday}ที่ %d/%m/%Y")
 
     lines = [
-        f"📊 <b>SECTOR ROTATION DAILY</b>",
+        f"📊 <b>MARKET CLOSE SUMMARY</b>",
         f"━━━━━━━━━━━━━━━━━━━━",
-        f"🕐 ปิดตลาด {now_bkk()}",
-        f"",
-        f"<b>Ranking วันนี้:</b>",
+        f"📅 {date_str} | 17:00 Bangkok",
         f"",
     ]
 
+    # ── SET Index ──────────────────────────────────────────────────
+    if set_index:
+        idx_chg  = set_index["change_pct"]
+        idx_sign = "+" if idx_chg >= 0 else ""
+        idx_dir  = "📈" if idx_chg >= 0 else "📉"
+        lines += [
+            f"🇹🇭 <b>SET Index</b>",
+            f"   {idx_dir} {set_index['price']:.2f} pts  "
+            f"<b>{idx_sign}{idx_chg:.2f}%</b>",
+            f"   Vol: {fmt_volume(set_index['volume'])} หุ้น",
+            f"",
+        ]
+
+    # ── Sector Ranking ─────────────────────────────────────────────
+    lines.append(f"🔄 <b>Sector Ranking วันนี้</b>")
     for rank, (key, s) in enumerate(sorted_sectors):
         chg  = s["avg_change"]
         sign = "+" if chg >= 0 else ""
         bar  = performance_bar(chg)
-        top  = s["top_stock"]
+        top  = s["top_stock"] if chg >= 0 else s["bot_stock"]
         lines.append(
             f"{rank_emoji(rank)} {s['name_th']}\n"
             f"   {bar} <b>{sign}{chg:.2f}%</b>  "
-            f"Best: {top['ticker']} {'+' if top['change_pct']>=0 else ''}{top['change_pct']:.1f}%"
+            f"{'▲' if chg>=0 else '▼'}{top['ticker']} "
+            f"{'+' if top['change_pct']>=0 else ''}{top['change_pct']:.1f}%"
         )
 
-    # สรุปสั้นๆ
-    w_chg = winner[1]["avg_change"]
-    l_chg = loser[1]["avg_change"]
-    breadth_up   = sum(1 for _, s in sorted_sectors if s["avg_change"] > 0)
-    breadth_down = len(sorted_sectors) - breadth_up
+    lines.append(f"")
 
+    # ── Top Gainers ────────────────────────────────────────────────
+    if movers.get("gainers"):
+        lines.append(f"🚀 <b>Top Gainers</b>")
+        for s in movers["gainers"]:
+            lines.append(
+                f"   📈 <b>{s['ticker']}</b>  "
+                f"+{s['change_pct']:.2f}%  "
+                f"Vol {fmt_volume(s['volume'])}"
+            )
+        lines.append(f"")
+
+    # ── Top Losers ─────────────────────────────────────────────────
+    if movers.get("losers"):
+        lines.append(f"💥 <b>Top Losers</b>")
+        for s in movers["losers"]:
+            lines.append(
+                f"   📉 <b>{s['ticker']}</b>  "
+                f"{s['change_pct']:.2f}%  "
+                f"Vol {fmt_volume(s['volume'])}"
+            )
+        lines.append(f"")
+
+    # ── Most Active ────────────────────────────────────────────────
+    if movers.get("most_active"):
+        lines.append(f"🔥 <b>Most Active (Volume)</b>")
+        for s in movers["most_active"]:
+            sign = "+" if s["change_pct"] >= 0 else ""
+            lines.append(
+                f"   📊 <b>{s['ticker']}</b>  "
+                f"Vol {fmt_volume(s['volume'])}  "
+                f"{sign}{s['change_pct']:.1f}%"
+            )
+        lines.append(f"")
+
+    # ── Market Summary ─────────────────────────────────────────────
+    market_mood = "🟢 ตลาดบวก" if breadth_up > breadth_down else "🔴 ตลาดลบ"
     lines += [
-        f"",
         f"━━━━━━━━━━━━━━━━━━━━",
-        f"🏆 แชมป์วันนี้: {winner[1]['name_th']} (+{w_chg:.2f}%)",
-        f"📉 อ่อนสุด: {loser[1]['name_th']} ({l_chg:.2f}%)",
+        f"🏆 Sector แชมป์: {winner[1]['name_th']} "
+        f"(+{winner[1]['avg_change']:.2f}%)",
+        f"📉 Sector อ่อน: {loser[1]['name_th']} "
+        f"({loser[1]['avg_change']:.2f}%)",
         f"",
-        f"📈 Sector ขึ้น: {breadth_up} | 📉 ลง: {breadth_down}",
-        f"{'🟢 ตลาดเป็นบวกวันนี้' if breadth_up > breadth_down else '🔴 ตลาดเป็นลบวันนี้'}",
+        f"📈 Sector ขึ้น {breadth_up} | "
+        f"📉 ลง {breadth_down}  →  {market_mood}",
     ]
     return "\n".join(lines)
 
@@ -393,14 +489,16 @@ class SectorRotationTracker:
 
                 self.prev_sector_changes[sector_key] = chg
 
-        # Evening Report 16:35
+        # Evening Report 17:00
         if (is_weekday() and
-                now.hour == EVENING_HOUR and now.minute >= EVENING_MIN and
+                now.hour == EVENING_HOUR and now.minute < SCAN_INTERVAL_MIN and
                 self.evening_sent_date != today):
             print(f"[{now_bkk()}] 🌆 Evening report...")
-            data = await fetch_sector_data(client)
+            data      = await fetch_sector_data(client)
+            set_idx   = await fetch_set_index(client)
+            movers    = await fetch_top_movers(client)
             if data:
-                msg = fmt_evening_report(data)
+                msg = fmt_evening_report(data, set_idx, movers)
                 ok  = await send_telegram(msg, client)
                 if ok:
                     self.evening_sent_date = today
