@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python foreign_flow.py"
+startCommand = "python insider_short.py"
