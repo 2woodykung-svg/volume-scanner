@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python volume_scanner.py"
+startCommand = "python sector_tracker.py"
