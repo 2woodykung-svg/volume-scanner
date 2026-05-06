@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python sector_tracker.py"
+startCommand = "python foreign_flow.py"
